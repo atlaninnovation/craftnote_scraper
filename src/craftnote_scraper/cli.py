@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Final
 
@@ -12,6 +12,13 @@ from rich.table import Table
 
 from craftnote_scraper.api.client import CraftnoteClient
 from craftnote_scraper.api.exceptions import CraftnoteAPIError
+from craftnote_scraper.config import (
+    DEFAULT_DB_PATH,
+    DEFAULT_MATRIX_MAPPING_PATH,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_SYNC_LOOKBACK_HOURS,
+    EXCLUDED_FOLDERS,
+)
 from craftnote_scraper.mapping.models import WindFarm
 from craftnote_scraper.mapping.wind_farms import (
     build_wind_farm_map,
@@ -26,11 +33,8 @@ from craftnote_scraper.scraper.downloader import (
 from craftnote_scraper.storage.minio_adapter import MinIOAdapter
 from craftnote_scraper.storage.models import DownloadedFile, FileType
 from craftnote_scraper.storage.organizer import save_file
-from craftnote_scraper.storage.tracker import DownloadTracker
+from craftnote_scraper.storage.tracker import DownloadTracker, SyncStatus
 
-DEFAULT_OUTPUT_DIR: Final[str] = "downloads"
-DEFAULT_DB_PATH: Final[str] = "downloads.db"
-DEFAULT_MATRIX_MAPPING_PATH: Final[str] = "learning/wind-farm-spaces.md"
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_ERROR: Final[int] = 1
 
@@ -38,37 +42,6 @@ MINIO_ENDPOINT_VAR: Final[str] = "MINIO_ENDPOINT"
 MINIO_ACCESS_KEY_VAR: Final[str] = "MINIO_ACCESS_KEY"
 MINIO_CREDENTIAL_VAR: Final[str] = "MINIO_SECRET_KEY"
 MINIO_USE_SSL_VAR: Final[str] = "MINIO_USE_SSL"
-
-EXCLUDED_FOLDERS: Final[set[str]] = {
-    # Administrative / IT
-    "DFÜ",
-    "IT Projekte ",
-    "IT-Projekte",
-    "Koordinaten Windparks",
-    "Lager",
-    "Marketing",
-    "Projekte",
-    "Rechnungen Scan",
-    "Starlink Görlitz",
-    "Test",
-    "Unternehmens-Chat",
-    # Real estate
-    "Doku Unterkunft",
-    "Eimsbüttler Chaussee",
-    "Immobilien",
-    "Immobilien Hamburg",
-    # Insurance / damages
-    "Einbruchschaden Langendorf",
-    "Gewährleistung",
-    "Versicherungsfälle",
-    "Versicherungsschäden",
-    # External / misc
-    "Beispiel-Projekt",
-    "Fremdaufträge",
-    "Fuhrpark",
-    "Sommerfest 2021",
-    "Windkraftmesse 2024",
-}
 
 app = typer.Typer(
     name="craftnote-scraper",
@@ -572,6 +545,251 @@ async def _sync_farms(
         raise typer.Exit(EXIT_CODE_ERROR)
 
 
+def parse_duration(duration_str: str) -> timedelta:
+    duration_str = duration_str.strip().lower()
+
+    if duration_str.endswith("h"):
+        return timedelta(hours=int(duration_str[:-1]))
+    if duration_str.endswith("d"):
+        return timedelta(days=int(duration_str[:-1]))
+    if duration_str.endswith("w"):
+        return timedelta(weeks=int(duration_str[:-1]))
+
+    raise typer.BadParameter(
+        f"Invalid duration format: {duration_str}. Use format like 24h, 7d, 1w"
+    )
+
+
+@app.command("sync-incremental")
+def sync_incremental(
+    since: Annotated[
+        str | None,
+        typer.Option("--since", "-s", help="Duration to look back (e.g. 24h, 7d, 1w)"),
+    ] = None,
+    since_last_run: Annotated[
+        bool,
+        typer.Option("--since-last-run", help="Sync projects modified since last sync run"),
+    ] = False,
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", "-o", help="Output directory for downloads")
+    ] = Path(DEFAULT_OUTPUT_DIR),
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to download tracking database")
+    ] = Path(DEFAULT_DB_PATH),
+    headless: Annotated[
+        bool, typer.Option("--headless/--no-headless", help="Run browser in headless mode")
+    ] = True,
+    upload_to_minio: Annotated[
+        bool, typer.Option("--upload-to-minio", "-u", help="Upload files to MinIO after download")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", "-n", help="Show what would be synced without downloading")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose output")] = False,
+) -> None:
+    """Incremental sync - only process projects modified since a given time."""
+    setup_logging(verbose)
+
+    if not since and not since_last_run:
+        since = f"{DEFAULT_SYNC_LOOKBACK_HOURS}h"
+        console.print(f"[dim]No --since specified, defaulting to {since}[/dim]")
+
+    if since and since_last_run:
+        error_console.print("[red]Error:[/red] Cannot use both --since and --since-last-run")
+        raise typer.Exit(EXIT_CODE_ERROR)
+
+    tracker = DownloadTracker(db_path)
+
+    if since_last_run:
+        last_sync = tracker.get_last_sync_time()
+        if last_sync is None:
+            error_console.print("[red]Error:[/red] No previous sync found. Use --since instead.")
+            raise typer.Exit(EXIT_CODE_ERROR)
+        cutoff_time = last_sync
+        console.print(f"Syncing projects modified since last run: {last_sync:%Y-%m-%d %H:%M}")
+    elif since is not None:
+        duration = parse_duration(since)
+        cutoff_time = datetime.now() - duration
+        console.print(f"Syncing projects modified since: {cutoff_time:%Y-%m-%d %H:%M}")
+
+    minio: MinIOAdapter | None = None
+    if upload_to_minio:
+        try:
+            minio = create_minio_adapter()
+        except ValueError as e:
+            error_console.print(f"[red]MinIO configuration error:[/red] {e}")
+            raise typer.Exit(EXIT_CODE_ERROR) from e
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("Fetching modified projects from API...", total=None)
+        try:
+            modified_projects = asyncio.run(_get_modified_projects(cutoff_time, EXCLUDED_FOLDERS))
+        except CraftnoteAPIError as e:
+            error_console.print(f"[red]API Error:[/red] {e}")
+            raise typer.Exit(EXIT_CODE_ERROR) from e
+
+    if not modified_projects:
+        console.print("[green]No projects modified since cutoff time.[/green]")
+        raise typer.Exit(EXIT_CODE_SUCCESS)
+
+    console.print(f"Found [cyan]{len(modified_projects)}[/cyan] modified projects")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run mode - no files will be downloaded[/yellow]\n")
+        table = Table(title="Projects to Sync")
+        table.add_column("Project Name", style="cyan")
+        table.add_column("Last Edited", style="green")
+        table.add_column("Project ID", style="dim")
+
+        for project in modified_projects:
+            last_edited = "N/A"
+            if project.last_edited_date:
+                last_edited = datetime.fromtimestamp(project.last_edited_date).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+            table.add_row(project.name, last_edited, project.id[:12] + "...")
+
+        console.print(table)
+        if upload_to_minio:
+            console.print("\n[cyan]MinIO upload: enabled[/cyan]")
+        raise typer.Exit(EXIT_CODE_SUCCESS)
+
+    asyncio.run(
+        _sync_incremental_projects(modified_projects, output_dir, tracker, headless, verbose, minio)
+    )
+
+
+async def _get_modified_projects(since: datetime, excluded_folders: frozenset[str]) -> list:
+    async with CraftnoteClient() as client:
+        return await client.get_modified_projects(since, excluded_folders)
+
+
+async def _sync_incremental_projects(
+    projects: list,
+    output_dir: Path,
+    tracker: DownloadTracker,
+    headless: bool,
+    verbose: bool,
+    minio: MinIOAdapter | None = None,
+) -> None:
+    total_downloaded = 0
+    total_skipped = 0
+    total_errors = 0
+    total_uploaded = 0
+    projects_synced = 0
+
+    config = BrowserConfig(headless=headless, executable_path=BRAVE_EXECUTABLE_PATH)
+    async with browser_context(config) as context:
+        page = await context.new_page()
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            overall_task = progress.add_task(
+                "[cyan]Syncing modified projects...", total=len(projects)
+            )
+
+            for project in projects:
+                progress.update(overall_task, description=f"[cyan]{project.name}")
+                project_files_downloaded = 0
+                sync_status = SyncStatus.SUCCESS
+
+                try:
+                    project_dir = output_dir / project.name
+                    results = await download_all_project_files(
+                        page=page,
+                        project_id=project.id,
+                        download_dir=project_dir,
+                    )
+
+                    for result in results:
+                        file_id = f"{project.id}_{result.metadata.filename}"
+
+                        if tracker.is_already_downloaded(file_id):
+                            total_skipped += 1
+                            continue
+
+                        final_path, checksum = save_file(
+                            content=result.saved_path.read_bytes(),
+                            wind_farm=project.name,
+                            turbine=project.name,
+                            filename=result.metadata.filename,
+                            base_dir=output_dir,
+                        )
+
+                        downloaded_file = DownloadedFile(
+                            file_id=file_id,
+                            filename=result.metadata.filename,
+                            file_type=FileType.from_filename(result.metadata.filename),
+                            downloaded_at=datetime.now(),
+                            path=final_path,
+                            checksum=checksum,
+                            wind_farm=project.name,
+                            turbine=project.name,
+                        )
+                        tracker.record_download(downloaded_file)
+                        total_downloaded += 1
+                        project_files_downloaded += 1
+
+                        if minio:
+                            upload_result = minio.upload_file(
+                                file_path=final_path,
+                                wind_farm=project.name,
+                                turbine_name=project.name,
+                                original_filename=result.metadata.filename,
+                                craftnote_project_id=project.id,
+                            )
+                            if upload_result.uploaded:
+                                tracker.update_minio_upload(
+                                    file_id=file_id,
+                                    object_key=upload_result.object_key,
+                                    uploaded_at=datetime.now(),
+                                )
+                                total_uploaded += 1
+
+                    projects_synced += 1
+
+                except Exception as e:
+                    total_errors += 1
+                    sync_status = SyncStatus.FAILED
+                    if verbose:
+                        error_console.print(f"[red]Error syncing {project.name}: {e}[/red]")
+
+                last_edited_at = None
+                if project.last_edited_date:
+                    last_edited_at = datetime.fromtimestamp(project.last_edited_date)
+
+                tracker.record_project_sync(
+                    project_id=project.id,
+                    project_name=project.name,
+                    wind_farm=project.name,
+                    last_edited_at=last_edited_at,
+                    files_downloaded=project_files_downloaded,
+                    sync_status=sync_status,
+                )
+
+                progress.advance(overall_task)
+
+    console.print("\n[green]Incremental sync complete![/green]")
+    console.print(f"  Projects synced: {projects_synced}")
+    console.print(f"  Files downloaded: {total_downloaded}")
+    console.print(f"  Files skipped: {total_skipped}")
+    if minio:
+        console.print(f"  Uploaded to MinIO: {total_uploaded}")
+    if total_errors > 0:
+        error_console.print(f"  [red]Errors: {total_errors}[/red]")
+        raise typer.Exit(EXIT_CODE_ERROR)
+
+
 @app.command("status")
 def status(
     farm: Annotated[
@@ -698,6 +916,55 @@ def mapping(
                 console.print(f"  {farm_name} / {turbine_name}")
             if len(unmatched_turbines) > 20:
                 console.print(f"  ... and {len(unmatched_turbines) - 20} more")
+
+
+@app.command("daemon")
+def daemon(
+    schedule: Annotated[
+        str | None,
+        typer.Option("--schedule", "-s", help="Cron expression for sync schedule"),
+    ] = None,
+    output_dir: Annotated[
+        Path, typer.Option("--output-dir", "-o", help="Output directory for downloads")
+    ] = Path(DEFAULT_OUTPUT_DIR),
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to download tracking database")
+    ] = Path(DEFAULT_DB_PATH),
+    upload_to_minio: Annotated[
+        bool, typer.Option("--upload-to-minio", "-u", help="Upload files to MinIO after download")
+    ] = False,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose output")] = False,
+) -> None:
+    """Run as a background daemon with scheduled incremental sync."""
+    setup_logging(verbose)
+
+    from craftnote_scraper.scheduler import (
+        SYNC_SCHEDULE_ENV_VAR,
+        get_sync_schedule,
+    )
+    from craftnote_scraper.scheduler import (
+        run_daemon as run_daemon_async,
+    )
+
+    if schedule:
+        os.environ[SYNC_SCHEDULE_ENV_VAR] = schedule
+
+    actual_schedule = get_sync_schedule()
+    console.print(f"Starting daemon with schedule: [cyan]{actual_schedule}[/cyan]")
+    console.print(f"Output directory: {output_dir}")
+    console.print(f"Database: {db_path}")
+    if upload_to_minio:
+        console.print("[cyan]MinIO upload: enabled[/cyan]")
+    console.print("\nPress Ctrl+C to stop\n")
+
+    asyncio.run(
+        run_daemon_async(
+            output_dir=output_dir,
+            db_path=db_path,
+            headless=True,
+            enable_minio=upload_to_minio,
+        )
+    )
 
 
 def main() -> None:

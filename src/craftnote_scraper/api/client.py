@@ -1,5 +1,6 @@
 import os
 from collections.abc import AsyncIterator
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
@@ -244,3 +245,20 @@ class CraftnoteClient:
             for member in members:
                 yield member
             offset += len(members)
+
+    async def get_modified_projects(
+        self,
+        since: datetime,
+        excluded_folders: frozenset[str] | set[str] | None = None,
+    ) -> list[Project]:
+        cutoff_timestamp = since.timestamp()
+        modified_projects: list[Project] = []
+
+        async for project in self.iter_all_projects():
+            if excluded_folders and project.name in excluded_folders:
+                continue
+
+            if project.last_edited_date and project.last_edited_date > cutoff_timestamp:
+                modified_projects.append(project)
+
+        return modified_projects

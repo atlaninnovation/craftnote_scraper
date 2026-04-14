@@ -13,6 +13,7 @@ dependencies = [
     "rich>=13.9",
     "minio>=7.2.20",
     "python-slugify>=8.0.4",
+    "aioclock>=0.1",
 ]
 
 [project.scripts]
