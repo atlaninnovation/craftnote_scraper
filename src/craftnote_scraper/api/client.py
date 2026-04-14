@@ -13,10 +13,17 @@ from craftnote_scraper.api.exceptions import (
     CraftnoteRateLimitError,
 )
 from craftnote_scraper.api.models import CompanyMember, Project, ProjectFile
+from craftnote_scraper.retry import RetryConfig, retry_async
 
 DEFAULT_BASE_URL: Final[str] = "https://europe-west1-craftnote-live.cloudfunctions.net/api/v1"
 DEFAULT_LIMIT: Final[int] = 100
 DEFAULT_TIMEOUT_SECONDS: Final[int] = 30
+
+RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    CraftnoteRateLimitError,
+    httpx.TimeoutException,
+    httpx.NetworkError,
+)
 
 
 class PaginationMode(StrEnum):
@@ -50,6 +57,7 @@ class CraftnoteClient:
         api_key: str | None = None,
         base_url: str | None = None,
         secrets_path: Path | None = None,
+        retry_config: RetryConfig | None = None,
     ):
         secrets_file = secrets_path or Path("secrets.env")
         secrets = _load_secrets_env(secrets_file)
@@ -65,6 +73,7 @@ class CraftnoteClient:
         self._base_url: str = f"{base}/api/v1" if not base.endswith("/api/v1") else base
 
         self._client: httpx.AsyncClient | None = None
+        self._retry_config = retry_config or RetryConfig()
 
     async def __aenter__(self) -> "CraftnoteClient":
         self._client = httpx.AsyncClient(
@@ -110,6 +119,26 @@ class CraftnoteClient:
 
         return {to_snake(k): v for k, v in data.items()}
 
+    async def _request_with_retry(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, str | int] | None = None,
+    ) -> httpx.Response:
+        client = self._ensure_client()
+
+        async def make_request() -> httpx.Response:
+            response = await client.request(method, path, params=params)
+            self._handle_response_errors(response)
+            return response
+
+        return await retry_async(
+            make_request,
+            RETRYABLE_EXCEPTIONS,
+            self._retry_config,
+            operation_name=f"{method} {path}",
+        )
+
     async def list_projects(
         self,
         limit: int = DEFAULT_LIMIT,
@@ -117,7 +146,6 @@ class CraftnoteClient:
         pagination_mode: PaginationMode = PaginationMode.OFFSET,
         start_after: str | None = None,
     ) -> list[Project]:
-        client = self._ensure_client()
         params: dict[str, str | int] = {"limit": limit}
 
         if pagination_mode == PaginationMode.CURSOR:
@@ -127,17 +155,13 @@ class CraftnoteClient:
         else:
             params["offset"] = offset
 
-        response = await client.get("/projects", params=params)
-        self._handle_response_errors(response)
-
+        response = await self._request_with_retry("GET", "/projects", params)
         data = response.json()
         projects_data = data.get("projects", [])
         return [Project(**self._convert_camel_to_snake(p)) for p in projects_data]
 
     async def get_project(self, project_id: str) -> Project:
-        client = self._ensure_client()
-        response = await client.get(f"/projects/{project_id}")
-        self._handle_response_errors(response)
+        response = await self._request_with_retry("GET", f"/projects/{project_id}")
         return Project(**self._convert_camel_to_snake(response.json()))
 
     async def list_project_files(
@@ -148,7 +172,6 @@ class CraftnoteClient:
         pagination_mode: PaginationMode = PaginationMode.OFFSET,
         start_after: str | None = None,
     ) -> list[ProjectFile]:
-        client = self._ensure_client()
         params: dict[str, str | int] = {"limit": limit}
 
         if pagination_mode == PaginationMode.CURSOR:
@@ -158,9 +181,7 @@ class CraftnoteClient:
         else:
             params["offset"] = offset
 
-        response = await client.get(f"/projects/{project_id}/files", params=params)
-        self._handle_response_errors(response)
-
+        response = await self._request_with_retry("GET", f"/projects/{project_id}/files", params)
         data = response.json()
         files_data = data.get("files", [])
         return [ProjectFile(**self._convert_camel_to_snake(f)) for f in files_data]
@@ -172,7 +193,6 @@ class CraftnoteClient:
         pagination_mode: PaginationMode = PaginationMode.OFFSET,
         start_after: str | None = None,
     ) -> list[CompanyMember]:
-        client = self._ensure_client()
         params: dict[str, str | int] = {"limit": limit}
 
         if pagination_mode == PaginationMode.CURSOR:
@@ -182,17 +202,13 @@ class CraftnoteClient:
         else:
             params["offset"] = offset
 
-        response = await client.get("/company/members", params=params)
-        self._handle_response_errors(response)
-
+        response = await self._request_with_retry("GET", "/company/members", params)
         data = response.json()
         members_data = data.get("members", [])
         return [CompanyMember(**self._convert_camel_to_snake(m)) for m in members_data]
 
     async def get_current_member(self) -> CompanyMember:
-        client = self._ensure_client()
-        response = await client.get("/company/members/me")
-        self._handle_response_errors(response)
+        response = await self._request_with_retry("GET", "/company/members/me")
         return CompanyMember(**self._convert_camel_to_snake(response.json()))
 
     async def iter_all_projects(self, page_size: int = DEFAULT_LIMIT) -> AsyncIterator[Project]:
