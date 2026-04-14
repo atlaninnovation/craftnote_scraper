@@ -1,6 +1,8 @@
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
@@ -23,12 +25,28 @@ CREATE TABLE IF NOT EXISTS downloaded_files (
 )
 """
 
+CREATE_PROJECT_SYNC_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS project_sync_status (
+    project_id TEXT PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    wind_farm TEXT NOT NULL,
+    last_synced_at TEXT NOT NULL,
+    last_edited_at TEXT,
+    files_downloaded INTEGER DEFAULT 0,
+    sync_status TEXT NOT NULL DEFAULT 'success'
+)
+"""
+
 CREATE_INDEX_CHECKSUM_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_checksum ON downloaded_files (checksum)
 """
 
 CREATE_INDEX_WIND_FARM_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_wind_farm ON downloaded_files (wind_farm)
+"""
+
+CREATE_INDEX_PROJECT_SYNC_WIND_FARM_SQL: Final[str] = """
+CREATE INDEX IF NOT EXISTS idx_project_sync_wind_farm ON project_sync_status (wind_farm)
 """
 
 ADD_MINIO_OBJECT_KEY_COLUMN_SQL: Final[str] = """
@@ -44,6 +62,13 @@ INSERT OR REPLACE INTO downloaded_files
     (file_id, filename, file_type, downloaded_at, path, checksum, wind_farm, turbine,
      minio_object_key, minio_uploaded_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+INSERT_PROJECT_SYNC_SQL: Final[str] = """
+INSERT OR REPLACE INTO project_sync_status
+    (project_id, project_name, wind_farm, last_synced_at,
+     last_edited_at, files_downloaded, sync_status)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 """
 
 SELECT_BY_ID_SQL: Final[str] = """
@@ -77,6 +102,39 @@ SET minio_object_key = ?, minio_uploaded_at = ?
 WHERE file_id = ?
 """
 
+SELECT_PROJECT_SYNC_BY_ID_SQL: Final[str] = """
+SELECT project_id, project_name, wind_farm, last_synced_at,
+       last_edited_at, files_downloaded, sync_status
+FROM project_sync_status WHERE project_id = ?
+"""
+
+SELECT_LAST_SYNC_TIME_SQL: Final[str] = """
+SELECT MAX(last_synced_at) FROM project_sync_status
+"""
+
+SELECT_ALL_PROJECT_SYNCS_SQL: Final[str] = """
+SELECT project_id, project_name, wind_farm, last_synced_at,
+       last_edited_at, files_downloaded, sync_status
+FROM project_sync_status ORDER BY last_synced_at DESC
+"""
+
+
+class SyncStatus(StrEnum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    PARTIAL = "partial"
+
+
+@dataclass(frozen=True)
+class ProjectSyncRecord:
+    project_id: str
+    project_name: str
+    wind_farm: str
+    last_synced_at: datetime
+    last_edited_at: datetime | None
+    files_downloaded: int
+    sync_status: SyncStatus
+
 
 def _row_to_downloaded_file(
     row: tuple[str, str, str, str, str, str, str, str, str | None, str | None],
@@ -109,6 +167,29 @@ def _row_to_downloaded_file(
     )
 
 
+def _row_to_project_sync_record(
+    row: tuple[str, str, str, str, str | None, int, str],
+) -> ProjectSyncRecord:
+    (
+        project_id,
+        project_name,
+        wind_farm,
+        last_synced_at,
+        last_edited_at,
+        files_downloaded,
+        sync_status,
+    ) = row
+    return ProjectSyncRecord(
+        project_id=project_id,
+        project_name=project_name,
+        wind_farm=wind_farm,
+        last_synced_at=datetime.fromisoformat(last_synced_at),
+        last_edited_at=datetime.fromisoformat(last_edited_at) if last_edited_at else None,
+        files_downloaded=files_downloaded,
+        sync_status=SyncStatus(sync_status),
+    )
+
+
 class DownloadTracker:
     def __init__(self, db_path: Path | None = None):
         self._db_path = db_path or Path(DEFAULT_DB_PATH)
@@ -117,8 +198,10 @@ class DownloadTracker:
     def _init_db(self) -> None:
         with self._connection() as conn:
             conn.execute(CREATE_TABLE_SQL)
+            conn.execute(CREATE_PROJECT_SYNC_TABLE_SQL)
             conn.execute(CREATE_INDEX_CHECKSUM_SQL)
             conn.execute(CREATE_INDEX_WIND_FARM_SQL)
+            conn.execute(CREATE_INDEX_PROJECT_SYNC_WIND_FARM_SQL)
             self._migrate_add_minio_columns(conn)
 
     def _migrate_add_minio_columns(self, conn: sqlite3.Connection) -> None:
@@ -190,3 +273,47 @@ class DownloadTracker:
             else:
                 cursor = conn.execute(SELECT_ALL_SQL)
             return [_row_to_downloaded_file(row) for row in cursor.fetchall()]
+
+    def record_project_sync(
+        self,
+        project_id: str,
+        project_name: str,
+        wind_farm: str,
+        last_edited_at: datetime | None,
+        files_downloaded: int,
+        sync_status: SyncStatus = SyncStatus.SUCCESS,
+    ) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                INSERT_PROJECT_SYNC_SQL,
+                (
+                    project_id,
+                    project_name,
+                    wind_farm,
+                    datetime.now().isoformat(),
+                    last_edited_at.isoformat() if last_edited_at else None,
+                    files_downloaded,
+                    sync_status.value,
+                ),
+            )
+
+    def get_project_sync(self, project_id: str) -> ProjectSyncRecord | None:
+        with self._connection() as conn:
+            cursor = conn.execute(SELECT_PROJECT_SYNC_BY_ID_SQL, (project_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return _row_to_project_sync_record(row)
+
+    def get_last_sync_time(self) -> datetime | None:
+        with self._connection() as conn:
+            cursor = conn.execute(SELECT_LAST_SYNC_TIME_SQL)
+            row = cursor.fetchone()
+            if row is None or row[0] is None:
+                return None
+            return datetime.fromisoformat(row[0])
+
+    def get_all_project_syncs(self) -> list[ProjectSyncRecord]:
+        with self._connection() as conn:
+            cursor = conn.execute(SELECT_ALL_PROJECT_SYNCS_SQL)
+            return [_row_to_project_sync_record(row) for row in cursor.fetchall()]

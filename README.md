@@ -2,196 +2,244 @@
 
 Automated tool to download service report PDFs and spreadsheets (XLSX) from Craftnote project chats for wind turbine maintenance documentation.
 
-## Problem Statement
+## Features
 
-Wind turbine service reports and maintenance spreadsheets are stored in Craftnote's project chat feature. While Craftnote provides a REST API, the chat messages endpoint requires "Advanced API access" which is not available with standard API keys. Files in the chat are only accessible through the web interface.
+- **API-based project discovery** - Enumerate all projects and build wind farm/turbine structure
+- **Browser automation** - Download files from project chats using Playwright
+- **Incremental sync** - Only process projects modified since last sync
+- **Scheduled sync** - Run as a daemon with cron-style scheduling (AIOClock)
+- **MinIO integration** - Upload files to S3-compatible storage
+- **Download tracking** - SQLite database tracks all downloads and sync status
+- **Matrix room mapping** - Link Craftnote projects to Matrix room IDs
 
-## Solution
+## Quick Start
 
-A hybrid approach using:
-1. **Craftnote API** - Enumerate projects, get metadata, build wind farm/turbine structure
-2. **Playwright browser automation** - Login and download files from project chats
-3. **Matrix room mapping** - Link Craftnote projects to Matrix room IDs for cross-referencing
+```bash
+# Install dependencies
+uv sync
+
+# List all wind farms
+uv run craftnote-scraper list-farms
+
+# Download files for a specific wind farm
+uv run craftnote-scraper download --farm "Boddin"
+
+# Incremental sync (projects modified in last 24 hours)
+uv run craftnote-scraper sync-incremental --since 24h
+
+# Run as daemon (daily sync at 8 PM)
+uv run craftnote-scraper daemon
+```
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         Data Flow                                     │
-│                                                                       │
-│  ┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐ │
-│  │ Craftnote   │     │ Playwright  │     │   Local Storage         │ │
-│  │ API         │────▶│ Browser     │────▶│   downloads/            │ │
-│  │ (metadata)  │     │ (files)     │     │   ├── {wind_farm}/      │ │
-│  └─────────────┘     └─────────────┘     │   │   └── {turbine}/    │ │
-│        │                   │              │   │       ├── *.pdf     │ │
-│        │                   │              │   │       └── *.xlsx    │ │
-│        ▼                   ▼              └─────────────────────────┘ │
-│  - List projects     - Login to web app                               │
-│  - Map structure     - Navigate to chat                               │
-│  - Get metadata      - Download files                                 │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Data Flow                                       │
+│                                                                              │
+│  ┌─────────────┐     ┌─────────────┐     ┌──────────────┐     ┌───────────┐ │
+│  │ Craftnote   │     │ Playwright  │     │ Local        │     │ MinIO     │ │
+│  │ API         │────▶│ Browser     │────▶│ Storage      │────▶│ S3        │ │
+│  │ (metadata)  │     │ (files)     │     │ + SQLite     │     │ (backup)  │ │
+│  └─────────────┘     └─────────────┘     └──────────────┘     └───────────┘ │
+│        │                   │                    │                           │
+│        ▼                   ▼                    ▼                           │
+│  - List projects     - Login to web       - downloads/                      │
+│  - Filter modified   - Navigate chat      - downloads.db                    │
+│  - Get metadata      - Download files     - Track checksums                 │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Project Structure
 
 ```
 craftnote_scraper/
-├── src/
-│   └── craftnote_scraper/
-│       ├── __init__.py
-│       ├── api/                    # Craftnote API client
-│       │   ├── __init__.py
-│       │   ├── client.py           # HTTP client wrapper
-│       │   └── models.py           # Pydantic models for API responses
-│       ├── scraper/                # Playwright browser automation
-│       │   ├── __init__.py
-│       │   ├── browser.py          # Browser session management
-│       │   ├── login.py            # Authentication flow
-│       │   └── downloader.py       # File download logic
-│       ├── mapping/                # Project/Matrix mapping
-│       │   ├── __init__.py
-│       │   └── wind_farms.py       # Wind farm/turbine mapping
-│       ├── storage/                # File organization
-│       │   ├── __init__.py
-│       │   └── organizer.py        # Download organization
-│       └── cli.py                  # Command-line interface
-├── tests/
-│   ├── __init__.py
-│   ├── test_api/
-│   ├── test_scraper/
-│   └── test_mapping/
-├── pyproject.toml
-├── .env.example
-├── .gitignore
-├── AGENTS.md
-└── README.md
+├── src/craftnote_scraper/
+│   ├── api/                    # Craftnote API client
+│   │   ├── client.py           # Async HTTP client with retry
+│   │   ├── models.py           # Pydantic models (Project, ProjectFile)
+│   │   └── exceptions.py       # API error hierarchy
+│   ├── scraper/                # Playwright browser automation
+│   │   ├── browser.py          # Browser context management
+│   │   ├── login.py            # Authentication flow
+│   │   ├── downloader.py       # File download from chat
+│   │   └── exceptions.py       # Scraper errors
+│   ├── mapping/                # Wind farm/turbine mapping
+│   │   ├── models.py           # WindFarm, WindTurbine dataclasses
+│   │   └── wind_farms.py       # Structure discovery and mapping
+│   ├── storage/                # File storage and tracking
+│   │   ├── tracker.py          # SQLite download/sync tracking
+│   │   ├── models.py           # DownloadedFile, FileType
+│   │   ├── organizer.py        # File path utilities, checksums
+│   │   └── minio_adapter.py    # MinIO S3 upload
+│   ├── config.py               # Shared constants and configuration
+│   ├── scheduler.py            # AIOClock daemon for scheduled sync
+│   ├── retry.py                # Exponential backoff retry logic
+│   └── cli.py                  # Typer CLI entry point
+├── tests/                      # pytest test suite
+├── logs/                       # Daemon logs
+├── downloads/                  # Downloaded files
+├── downloads.db                # SQLite tracking database
+├── secrets.env                 # Credentials (not in git)
+└── pyproject.toml              # Project configuration
 ```
 
-## Layer Architecture
+## CLI Commands
 
-Following AGENTS.md conventions, the codebase uses a layered architecture:
+### List Wind Farms
 
-| Layer | Purpose | Dependencies |
-|-------|---------|--------------|
-| `api/models.py` | Pydantic models for API data | None (leaf module) |
-| `api/client.py` | Craftnote API HTTP client | models |
-| `mapping/wind_farms.py` | Wind farm/turbine/Matrix mapping | models |
-| `scraper/browser.py` | Playwright browser management | None |
-| `scraper/login.py` | Authentication flow | browser |
-| `scraper/downloader.py` | File download logic | browser, login |
-| `storage/organizer.py` | File organization | models, mapping |
-| `cli.py` | Entry point | all above |
-
-**Import rule**: Lower layers cannot import from higher layers.
-
-## Data Models
-
-### Wind Farm Structure
-
-```python
-@dataclass
-class WindTurbine:
-    craftnote_project_id: str
-    name: str                    # e.g., "BO1 - 16562"
-    matrix_room_id: str | None   # e.g., "!SQqWBcnerkrXAWzPKL:matrix.windreserve.de"
-
-@dataclass  
-class WindFarm:
-    name: str                    # e.g., "Boddin"
-    craftnote_folder_id: str
-    matrix_space_id: str | None
-    turbines: list[WindTurbine]
+```bash
+uv run craftnote-scraper list-farms
+uv run craftnote-scraper list-turbines --farm "Boddin"
 ```
 
-### Download Tracking
+### Download Files
 
-```python
-@dataclass
-class DownloadedFile:
-    file_id: str
-    filename: str
-    file_type: Literal["pdf", "xlsx"]
-    downloaded_at: datetime
-    craftnote_project_id: str
-    local_path: Path
-    size_bytes: int
-    checksum: str
+```bash
+# Download all files for a wind farm
+uv run craftnote-scraper download --farm "Boddin"
+
+# Download from all wind farms
+uv run craftnote-scraper download --all
+
+# Resume interrupted download (skip existing folders)
+uv run craftnote-scraper download --all --resume
+
+# Dry run (show what would be downloaded)
+uv run craftnote-scraper download --all --dry-run
+```
+
+### Incremental Sync
+
+```bash
+# Sync projects modified in last 24 hours
+uv run craftnote-scraper sync-incremental --since 24h
+
+# Sync projects modified in last 7 days
+uv run craftnote-scraper sync-incremental --since 7d
+
+# Sync projects modified since last sync run
+uv run craftnote-scraper sync-incremental --since-last-run
+
+# Sync with MinIO upload
+uv run craftnote-scraper sync-incremental --since 24h --upload-to-minio
+
+# Dry run
+uv run craftnote-scraper sync-incremental --since 24h --dry-run
+```
+
+### Daemon Mode
+
+```bash
+# Run with default schedule (daily at 8 PM Europe/Berlin)
+uv run craftnote-scraper daemon
+
+# Custom schedule (cron format)
+uv run craftnote-scraper daemon --schedule "0 6 * * *"
+
+# With MinIO upload
+uv run craftnote-scraper daemon --upload-to-minio
+```
+
+### Status and Mapping
+
+```bash
+# Show download statistics
+uv run craftnote-scraper status
+
+# Show Craftnote to Matrix mapping
+uv run craftnote-scraper mapping
 ```
 
 ## Configuration
 
-Environment variables (`secrets.env`):
+### Environment Variables
+
+Create `secrets.env` in the project root:
 
 ```bash
 # Craftnote API
-# Copy .env.example to secrets.env and fill in your credentials
 CRAFTNOTE_URL=https://europe-west1-craftnote-live.cloudfunctions.net
 CRAFTNOTE_API_KEY=your-api-key
 CRAFTNOTE_EMAIL=your-email@example.com
 CRAFTNOTE_PASSWORD=your-password
 
-# Storage
-DOWNLOAD_DIR=./downloads
+# MinIO Storage (optional)
+MINIO_ENDPOINT=10.10.10.55:9000
+MINIO_ACCESS_KEY=your-access-key
+MINIO_SECRET_KEY=your-secret-key
+MINIO_USE_SSL=false
+MINIO_BUCKET=service-reports
+
+# Scheduler (optional)
+SYNC_SCHEDULE=0 20 * * *
+SYNC_LOOKBACK_HOURS=24
 ```
 
-## CLI Usage
+### Excluded Folders
+
+The following folders are excluded from sync (not wind farm service reports):
+
+- Administrative: DFÜ, IT Projekte, Lager, Marketing, Test, etc.
+- Real Estate: Immobilien, Eimsbüttler Chaussee, etc.
+- Insurance: Versicherungsfälle, Gewährleistung, etc.
+- External: Fremdaufträge, Fuhrpark, etc.
+
+See `src/craftnote_scraper/config.py` for the full list.
+
+## Production Deployment (macOS)
+
+The daemon can be run as a launchd service:
 
 ```bash
-# List all wind farms and turbines
-uv run craftnote-scraper list-farms
+# Service location
+~/Library/LaunchAgents/de.windreserve.craftnote-sync.plist
 
-# Download files for a specific wind farm
-uv run craftnote-scraper download --farm "Boddin"
+# Start service
+launchctl load ~/Library/LaunchAgents/de.windreserve.craftnote-sync.plist
 
-# Download files for all wind farms
-uv run craftnote-scraper download --all
+# Stop service
+launchctl unload ~/Library/LaunchAgents/de.windreserve.craftnote-sync.plist
 
-# Sync (incremental download, skip existing)
-uv run craftnote-scraper sync
+# Check status
+launchctl list | grep craftnote
 
-# Show download status
-uv run craftnote-scraper status
+# View logs
+tail -f ~/DEV/craftnote_scraper/logs/daemon.log
 ```
 
-## Key Implementation Details
+## Database Schema
 
-### API Client
+### downloaded_files
 
-Uses `httpx.AsyncClient` for all HTTP requests:
+Tracks all downloaded files:
 
-```python
-async with httpx.AsyncClient() as client:
-    response = await client.get(
-        f"{base_url}/api/v1/projects",
-        headers={"X-CN-API-KEY": api_key}
-    )
-```
+| Column | Type | Description |
+|--------|------|-------------|
+| file_id | TEXT | Primary key (project_id + filename) |
+| filename | TEXT | Original filename |
+| file_type | TEXT | pdf, xlsx, or xls |
+| downloaded_at | TEXT | ISO timestamp |
+| path | TEXT | Local file path |
+| checksum | TEXT | SHA256 hash |
+| wind_farm | TEXT | Wind farm name |
+| turbine | TEXT | Turbine name |
+| minio_object_key | TEXT | MinIO object key (if uploaded) |
+| minio_uploaded_at | TEXT | Upload timestamp |
 
-### Playwright Session
+### project_sync_status
 
-Persistent browser context to maintain login state:
+Tracks per-project sync status:
 
-```python
-async with async_playwright() as p:
-    browser = await p.chromium.launch_persistent_context(
-        user_data_dir="./playwright-data",
-        headless=True
-    )
-```
-
-### File Detection in Chat
-
-Target files by extension:
-- `.pdf` - Service reports
-- `.xlsx` / `.xls` - Spreadsheets
-
-### Incremental Downloads
-
-Track downloads in SQLite database to avoid re-downloading:
-- Store file checksums
-- Skip files already downloaded
-- Allow force re-download option
+| Column | Type | Description |
+|--------|------|-------------|
+| project_id | TEXT | Primary key |
+| project_name | TEXT | Project name |
+| wind_farm | TEXT | Wind farm name |
+| last_synced_at | TEXT | ISO timestamp |
+| last_edited_at | TEXT | Last edit time from API |
+| files_downloaded | INTEGER | Files downloaded in sync |
+| sync_status | TEXT | success, failed, or partial |
 
 ## Development
 
@@ -210,9 +258,9 @@ uvx ruff check --fix .
 uvx ty check .
 ```
 
-## Verification Loop
+### Verification Loop
 
-Before committing, run:
+Before committing:
 
 ```bash
 uvx ruff format .
@@ -221,13 +269,28 @@ uvx ty check .
 uv run pytest
 ```
 
-## Limitations & Considerations
+## API Details
 
-1. **Rate Limiting**: Add delays between requests to avoid being blocked
-2. **Session Expiry**: Handle re-authentication when session expires
-3. **Dynamic Content**: Chat may use infinite scroll - handle pagination
-4. **File Naming**: Craftnote may not preserve original filenames
-5. **Concurrent Downloads**: Limit parallelism to be respectful to the server
+### Incremental Sync Logic
+
+1. Fetch all projects from Craftnote API (~15 seconds for 1500+ projects)
+2. Filter to projects with `last_edited_date > cutoff_time`
+3. Exclude administrative folders (not wind farms)
+4. For each modified project:
+   - Navigate to project chat with Playwright
+   - Find and download PDF/XLSX/XLS files
+   - Track downloads in SQLite
+   - Upload to MinIO (if enabled)
+   - Record sync status
+
+### Estimated Time Savings
+
+| Approach | Projects | Est. Time |
+|----------|----------|-----------|
+| Full sync (all projects) | ~1500 | ~4+ hours |
+| Incremental (24h) | ~20 | ~5 minutes |
+
+**~98% reduction in processing time**
 
 ## License
 
