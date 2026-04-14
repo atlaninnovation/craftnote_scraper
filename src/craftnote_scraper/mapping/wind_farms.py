@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Final
 
@@ -22,6 +23,8 @@ TURBINE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:([A-Za-z]+\d*)\s*)?(\d+)\s*-\s*(.+)$"
 )
 SERIAL_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b(\d{5,})\b")
+SECONDS_PER_DAY: Final[int] = 86400
+DEFAULT_MAX_INACTIVE_DAYS: Final[int] = 365
 
 
 def parse_matrix_wind_farms(markdown_path: Path) -> list[MatrixWindFarm]:
@@ -157,9 +160,34 @@ def match_turbine_to_room(
     return None
 
 
+def _is_project_active(project: Project, max_inactive_days: int | None) -> bool:
+    """Check if a project was edited within the allowed inactive period."""
+    if max_inactive_days is None:
+        return True
+
+    last_edit = project.last_edited_date or project.last_opened_date
+    if last_edit is None:
+        return False
+
+    cutoff_timestamp = int(time.time()) - (max_inactive_days * SECONDS_PER_DAY)
+    return last_edit >= cutoff_timestamp
+
+
 async def discover_craftnote_structure(
     client: CraftnoteClient,
+    max_inactive_days: int | None = DEFAULT_MAX_INACTIVE_DAYS,
 ) -> dict[str, list[Project]]:
+    """
+    Discover Craftnote folder structure with projects.
+
+    Args:
+        client: Craftnote API client.
+        max_inactive_days: Exclude projects not edited within this many days.
+            Set to None to include all projects.
+
+    Returns:
+        Dict mapping folder names to lists of child projects.
+    """
     folders: dict[str, Project] = {}
     projects_by_parent: dict[str, list[Project]] = {}
 
@@ -167,6 +195,8 @@ async def discover_craftnote_structure(
         if project.project_type == ProjectType.FOLDER:
             folders[project.id] = project
         elif project.parent_project:
+            if not _is_project_active(project, max_inactive_days):
+                continue
             if project.parent_project not in projects_by_parent:
                 projects_by_parent[project.parent_project] = []
             projects_by_parent[project.parent_project].append(project)
@@ -182,8 +212,21 @@ async def discover_craftnote_structure(
 async def build_wind_farm_map(
     client: CraftnoteClient,
     matrix_farms: list[MatrixWindFarm],
+    max_inactive_days: int | None = DEFAULT_MAX_INACTIVE_DAYS,
 ) -> list[WindFarm]:
-    craftnote_structure = await discover_craftnote_structure(client)
+    """
+    Build wind farm mapping between Craftnote and Matrix.
+
+    Args:
+        client: Craftnote API client.
+        matrix_farms: List of Matrix wind farms to match against.
+        max_inactive_days: Exclude projects not edited within this many days.
+            Set to None to include all projects. Defaults to 365 days.
+
+    Returns:
+        List of WindFarm objects with matched turbines.
+    """
+    craftnote_structure = await discover_craftnote_structure(client, max_inactive_days)
     wind_farms: list[WindFarm] = []
 
     folders: dict[str, Project] = {}

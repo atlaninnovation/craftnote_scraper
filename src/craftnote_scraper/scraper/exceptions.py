@@ -16,3 +16,15 @@ class TwoFactorRequiredError(ScraperError):
 
 class RateLimitedError(ScraperError):
     pass
+
+
+class DownloadError(ScraperError):
+    pass
+
+
+class ChatNavigationError(ScraperError):
+    pass
+
+
+class FileNotFoundInChatError(ScraperError):
+    pass
