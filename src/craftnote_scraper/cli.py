@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Final
 
@@ -21,6 +23,7 @@ from craftnote_scraper.scraper.downloader import (
     download_all_project_files,
     download_wind_farm_files,
 )
+from craftnote_scraper.storage.minio_adapter import MinIOAdapter
 from craftnote_scraper.storage.models import DownloadedFile, FileType
 from craftnote_scraper.storage.organizer import save_file
 from craftnote_scraper.storage.tracker import DownloadTracker
@@ -30,6 +33,11 @@ DEFAULT_DB_PATH: Final[str] = "downloads.db"
 DEFAULT_MATRIX_MAPPING_PATH: Final[str] = "learning/wind-farm-spaces.md"
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_ERROR: Final[int] = 1
+
+MINIO_ENDPOINT_VAR: Final[str] = "MINIO_ENDPOINT"
+MINIO_ACCESS_KEY_VAR: Final[str] = "MINIO_ACCESS_KEY"
+MINIO_CREDENTIAL_VAR: Final[str] = "MINIO_SECRET_KEY"
+MINIO_USE_SSL_VAR: Final[str] = "MINIO_USE_SSL"
 
 EXCLUDED_FOLDERS: Final[set[str]] = {
     # Administrative / IT
@@ -83,6 +91,32 @@ def setup_logging(verbose: bool) -> None:
         level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         force=True,
+    )
+
+
+def create_minio_adapter() -> MinIOAdapter:
+    endpoint = os.environ.get(MINIO_ENDPOINT_VAR)
+    access_key = os.environ.get(MINIO_ACCESS_KEY_VAR)
+    secret_key = os.environ.get(MINIO_CREDENTIAL_VAR)
+    use_ssl = os.environ.get(MINIO_USE_SSL_VAR, "true").lower() == "true"
+
+    if not endpoint or not access_key or not secret_key:
+        missing = [
+            var
+            for var, val in [
+                (MINIO_ENDPOINT_VAR, endpoint),
+                (MINIO_ACCESS_KEY_VAR, access_key),
+                (MINIO_CREDENTIAL_VAR, secret_key),
+            ]
+            if not val
+        ]
+        raise ValueError(f"Missing MinIO environment variables: {', '.join(missing)}")
+
+    return MinIOAdapter(
+        endpoint=endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        secure=use_ssl,
     )
 
 
@@ -374,6 +408,9 @@ def sync(
     headless: Annotated[
         bool, typer.Option("--headless/--no-headless", help="Run browser in headless mode")
     ] = True,
+    upload_to_minio: Annotated[
+        bool, typer.Option("--upload-to-minio", "-u", help="Upload files to MinIO after download")
+    ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", "-n", help="Show what would be downloaded")
     ] = False,
@@ -381,6 +418,14 @@ def sync(
 ) -> None:
     """Incremental download - skip already downloaded files."""
     setup_logging(verbose)
+
+    minio: MinIOAdapter | None = None
+    if upload_to_minio:
+        try:
+            minio = create_minio_adapter()
+        except ValueError as e:
+            error_console.print(f"[red]MinIO configuration error:[/red] {e}")
+            raise typer.Exit(EXIT_CODE_ERROR) from e
 
     tracker = DownloadTracker(db_path)
 
@@ -412,9 +457,11 @@ def sync(
         existing_ids = {f.file_id for f in existing}
         console.print(f"Already downloaded: {len(existing_ids)} files")
         console.print(f"Would sync {len(farms_to_sync)} wind farm(s)")
+        if upload_to_minio:
+            console.print("[cyan]MinIO upload: enabled[/cyan]")
         raise typer.Exit(EXIT_CODE_SUCCESS)
 
-    asyncio.run(_sync_farms(farms_to_sync, output_dir, tracker, headless, verbose))
+    asyncio.run(_sync_farms(farms_to_sync, output_dir, tracker, headless, verbose, minio))
 
 
 async def _sync_farms(
@@ -423,12 +470,13 @@ async def _sync_farms(
     tracker: DownloadTracker,
     headless: bool,
     verbose: bool,
+    minio: MinIOAdapter | None = None,
 ) -> None:
-    from datetime import datetime
-
     total_downloaded = 0
     total_skipped = 0
     total_errors = 0
+    total_uploaded = 0
+    total_upload_skipped = 0
 
     total_turbines = sum(1 for farm in farms for t in farm.turbines if t.craftnote_project_id)
 
@@ -487,6 +535,24 @@ async def _sync_farms(
                             tracker.record_download(downloaded_file)
                             total_downloaded += 1
 
+                            if minio:
+                                upload_result = minio.upload_file(
+                                    file_path=final_path,
+                                    wind_farm=farm.name,
+                                    turbine_name=turbine.name,
+                                    original_filename=result.metadata.filename,
+                                    craftnote_project_id=turbine.craftnote_project_id,
+                                )
+                                if upload_result.uploaded:
+                                    tracker.update_minio_upload(
+                                        file_id=file_id,
+                                        object_key=upload_result.object_key,
+                                        uploaded_at=datetime.now(),
+                                    )
+                                    total_uploaded += 1
+                                else:
+                                    total_upload_skipped += 1
+
                     except Exception as e:
                         total_errors += 1
                         if verbose:
@@ -497,6 +563,10 @@ async def _sync_farms(
     console.print("\n[green]Sync complete![/green]")
     console.print(f"  Downloaded: {total_downloaded}")
     console.print(f"  Skipped: {total_skipped}")
+    if minio:
+        console.print(f"  Uploaded to MinIO: {total_uploaded}")
+        if total_upload_skipped > 0:
+            console.print(f"  Upload skipped (duplicates): {total_upload_skipped}")
     if total_errors > 0:
         error_console.print(f"  [red]Errors: {total_errors}[/red]")
         raise typer.Exit(EXIT_CODE_ERROR)
