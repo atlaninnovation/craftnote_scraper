@@ -16,7 +16,7 @@ from craftnote_scraper.mapping.wind_farms import (
     discover_craftnote_structure,
     parse_matrix_wind_farms,
 )
-from craftnote_scraper.scraper.browser import BrowserConfig, browser_context
+from craftnote_scraper.scraper.browser import BRAVE_EXECUTABLE_PATH, BrowserConfig, browser_context
 from craftnote_scraper.scraper.downloader import (
     download_all_project_files,
     download_wind_farm_files,
@@ -30,6 +30,37 @@ DEFAULT_DB_PATH: Final[str] = "downloads.db"
 DEFAULT_MATRIX_MAPPING_PATH: Final[str] = "learning/wind-farm-spaces.md"
 EXIT_CODE_SUCCESS: Final[int] = 0
 EXIT_CODE_ERROR: Final[int] = 1
+
+EXCLUDED_FOLDERS: Final[set[str]] = {
+    # Administrative / IT
+    "DFÜ",
+    "IT Projekte ",
+    "IT-Projekte",
+    "Koordinaten Windparks",
+    "Lager",
+    "Marketing",
+    "Projekte",
+    "Rechnungen Scan",
+    "Starlink Görlitz",
+    "Test",
+    "Unternehmens-Chat",
+    # Real estate
+    "Doku Unterkunft",
+    "Eimsbüttler Chaussee",
+    "Immobilien",
+    "Immobilien Hamburg",
+    # Insurance / damages
+    "Einbruchschaden Langendorf",
+    "Gewährleistung",
+    "Versicherungsfälle",
+    "Versicherungsschäden",
+    # External / misc
+    "Beispiel-Projekt",
+    "Fremdaufträge",
+    "Fuhrpark",
+    "Sommerfest 2021",
+    "Windkraftmesse 2024",
+}
 
 app = typer.Typer(
     name="craftnote-scraper",
@@ -182,6 +213,9 @@ def download(
     headless: Annotated[
         bool, typer.Option("--headless/--no-headless", help="Run browser in headless mode")
     ] = True,
+    resume: Annotated[
+        bool, typer.Option("--resume", "-r", help="Skip farms that already have a folder")
+    ] = False,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", "-n", help="Show what would be downloaded")
     ] = False,
@@ -218,7 +252,10 @@ def download(
             raise typer.Exit(EXIT_CODE_ERROR)
         farms_to_download = [matched_farm]
     else:
-        farms_to_download = wind_farms
+        farms_to_download = [wf for wf in wind_farms if wf.name not in EXCLUDED_FOLDERS]
+        excluded_count = len(wind_farms) - len(farms_to_download)
+        if excluded_count > 0 and verbose:
+            console.print(f"[dim]Skipping {excluded_count} excluded folders[/dim]")
 
     if dry_run:
         console.print("[yellow]Dry run mode - no files will be downloaded[/yellow]\n")
@@ -230,7 +267,16 @@ def download(
         console.print(f"\nWould download from {len(farms_to_download)} wind farm(s)")
         raise typer.Exit(EXIT_CODE_SUCCESS)
 
-    asyncio.run(_download_farms(farms_to_download, output_dir, headless, verbose))
+    asyncio.run(_download_farms(farms_to_download, output_dir, headless, verbose, resume))
+
+
+def _sanitize_folder_name(name: str) -> str:
+    """Sanitize folder name to match downloader logic."""
+    invalid_chars = '<>:"/\\|?*'
+    result = name
+    for char in invalid_chars:
+        result = result.replace(char, "_")
+    return result.strip()
 
 
 async def _download_farms(
@@ -238,13 +284,34 @@ async def _download_farms(
     output_dir: Path,
     headless: bool,
     verbose: bool,
+    resume: bool = False,
 ) -> None:
     total_files = 0
     total_errors = 0
+    skipped_farms = 0
+
+    if resume:
+        farms_to_process = []
+        for farm in farms:
+            folder_name = _sanitize_folder_name(farm.name)
+            farm_dir = output_dir / folder_name
+            if farm_dir.exists():
+                skipped_farms += 1
+                if verbose:
+                    console.print(f"[dim]Skipping {farm.name} (already exists)[/dim]")
+            else:
+                farms_to_process.append(farm)
+        farms = farms_to_process
+        if skipped_farms > 0:
+            console.print(f"[yellow]Resuming: skipped {skipped_farms} existing farms[/yellow]")
+
+    if not farms:
+        console.print("[green]Nothing to download - all farms already processed[/green]")
+        return
 
     total_turbines = sum(1 for farm in farms for t in farm.turbines if t.craftnote_project_id)
 
-    config = BrowserConfig(headless=headless)
+    config = BrowserConfig(headless=headless, executable_path=BRAVE_EXECUTABLE_PATH)
     async with browser_context(config) as context:
         page = await context.new_page()
 
@@ -337,7 +404,7 @@ def sync(
             raise typer.Exit(EXIT_CODE_ERROR)
         farms_to_sync = [matched_farm]
     else:
-        farms_to_sync = wind_farms
+        farms_to_sync = [wf for wf in wind_farms if wf.name not in EXCLUDED_FOLDERS]
 
     if dry_run:
         console.print("[yellow]Dry run mode - checking what would be synced[/yellow]\n")
@@ -365,7 +432,7 @@ async def _sync_farms(
 
     total_turbines = sum(1 for farm in farms for t in farm.turbines if t.craftnote_project_id)
 
-    config = BrowserConfig(headless=headless)
+    config = BrowserConfig(headless=headless, executable_path=BRAVE_EXECUTABLE_PATH)
     async with browser_context(config) as context:
         page = await context.new_page()
 

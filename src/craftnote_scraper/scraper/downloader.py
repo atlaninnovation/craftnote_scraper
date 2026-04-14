@@ -36,8 +36,8 @@ class ChatSelector(StrEnum):
     MESSAGE_TIMESTAMP = ".message-date, time, [class*='time']"
 
 
-PAGE_LOAD_TIMEOUT_MS: Final[int] = 30_000
-CHAT_LOAD_TIMEOUT_MS: Final[int] = 30_000
+PAGE_LOAD_TIMEOUT_MS: Final[int] = 15_000
+CHAT_LOAD_TIMEOUT_MS: Final[int] = 10_000
 MODAL_TIMEOUT_MS: Final[int] = 5_000
 DOWNLOAD_TIMEOUT_MS: Final[int] = 60_000
 SCROLL_DELAY_MS: Final[int] = 500
