@@ -29,3 +29,5 @@ class DownloadedFile:
     checksum: str
     wind_farm: str
     turbine: str
+    minio_object_key: str | None = None
+    minio_uploaded_at: datetime | None = None
