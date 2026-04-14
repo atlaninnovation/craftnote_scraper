@@ -22,6 +22,7 @@ WIND_FARM_HEADER_PATTERN: Final[re.Pattern[str]] = re.compile(r"^##\s+(.+)$")
 TURBINE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:([A-Za-z]+\d*)\s*)?(\d+)\s*-\s*(.+)$"
 )
+TURBINE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^([A-Za-z]+)\s*(\d+)")
 SERIAL_NUMBER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\b(\d{5,})\b")
 SECONDS_PER_DAY: Final[int] = 86400
 DEFAULT_MAX_INACTIVE_DAYS: Final[int] = 365
@@ -119,6 +120,16 @@ def parse_turbine_name(name: str) -> tuple[str | None, str | None, str | None]:
     return prefix, number, serial
 
 
+def extract_turbine_id(name: str) -> tuple[str | None, str | None]:
+    """Extract turbine prefix and number from names like 'BO 1 ...', 'BA3 - ...', etc."""
+    match = TURBINE_ID_PATTERN.match(name.strip())
+    if not match:
+        return None, None
+    prefix = match.group(1).upper()
+    number = match.group(2)
+    return prefix, number
+
+
 def extract_serial_numbers(name: str) -> list[str]:
     return SERIAL_NUMBER_PATTERN.findall(name)
 
@@ -132,6 +143,18 @@ def match_turbine_to_room(
     for room in matrix_rooms:
         if normalize_name(room.name) == turbine_normalized:
             return room.room_id
+
+    turbine_prefix, turbine_number = extract_turbine_id(turbine_name)
+    if turbine_prefix and turbine_number:
+        for room in matrix_rooms:
+            room_prefix, room_number = extract_turbine_id(room.name)
+            if (
+                room_prefix
+                and room_number
+                and turbine_prefix == room_prefix
+                and turbine_number == room_number
+            ):
+                return room.room_id
 
     turbine_serials = extract_serial_numbers(turbine_name)
     if turbine_serials:
@@ -209,6 +232,21 @@ async def discover_craftnote_structure(
     return wind_farm_structure
 
 
+def find_related_matrix_farms(
+    farm_name: str, matrix_farms: list[MatrixWindFarm]
+) -> list[MatrixWindFarm]:
+    """Find all Matrix farms that share a common base name with the Craftnote farm."""
+    normalized_name = normalize_name(farm_name)
+    related: list[MatrixWindFarm] = []
+
+    for matrix_farm in matrix_farms:
+        matrix_normalized = normalize_name(matrix_farm.name)
+        if matrix_normalized in normalized_name or normalized_name in matrix_normalized:
+            related.append(matrix_farm)
+
+    return related
+
+
 async def build_wind_farm_map(
     client: CraftnoteClient,
     matrix_farms: list[MatrixWindFarm],
@@ -236,21 +274,30 @@ async def build_wind_farm_map(
 
     for farm_name, turbine_projects in craftnote_structure.items():
         matrix_farm = fuzzy_match_wind_farm(farm_name, matrix_farms)
+        related_farms = find_related_matrix_farms(farm_name, matrix_farms)
 
         if matrix_farm:
             logger.info("Matched Craftnote '%s' to Matrix '%s'", farm_name, matrix_farm.name)
         else:
             logger.warning("No Matrix match found for Craftnote wind farm: %s", farm_name)
 
+        all_related_rooms: tuple[MatrixRoom, ...] = ()
+        for related in related_farms:
+            all_related_rooms = (*all_related_rooms, *related.turbine_rooms)
+
         turbines: list[WindTurbine] = []
         for project in turbine_projects:
             matrix_room_id = None
             if matrix_farm:
                 matrix_room_id = match_turbine_to_room(project.name, matrix_farm.turbine_rooms)
-                if matrix_room_id:
-                    logger.debug("Matched turbine '%s' to room", project.name)
-                else:
-                    logger.warning("No Matrix room found for turbine: %s", project.name)
+
+            if not matrix_room_id and all_related_rooms:
+                matrix_room_id = match_turbine_to_room(project.name, all_related_rooms)
+
+            if matrix_room_id:
+                logger.debug("Matched turbine '%s' to room", project.name)
+            else:
+                logger.warning("No Matrix room found for turbine: %s", project.name)
 
             turbines.append(
                 WindTurbine(
