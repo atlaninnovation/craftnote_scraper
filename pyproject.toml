@@ -9,6 +9,8 @@ dependencies = [
     "playwright>=1.49",
     "polars>=1.18",
     "pydantic>=2.10",
+    "typer>=0.15",
+    "rich>=13.9",
 ]
 
 [project.scripts]
