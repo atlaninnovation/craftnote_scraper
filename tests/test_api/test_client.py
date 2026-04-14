@@ -14,14 +14,24 @@ from craftnote_scraper.api import (
     PaginationMode,
     ProjectType,
 )
+from craftnote_scraper.retry import RetryConfig
 
 TEST_API_KEY = "test-api-key"
 TEST_BASE_URL = "https://api.example.com/api/v1"
+
+NO_RETRY_CONFIG = RetryConfig(max_retries=0)
 
 
 @pytest.fixture
 def client() -> CraftnoteClient:
     return CraftnoteClient(api_key=TEST_API_KEY, base_url=TEST_BASE_URL)
+
+
+@pytest.fixture
+def client_no_retry() -> CraftnoteClient:
+    return CraftnoteClient(
+        api_key=TEST_API_KEY, base_url=TEST_BASE_URL, retry_config=NO_RETRY_CONFIG
+    )
 
 
 class TestListProjects:
@@ -207,46 +217,48 @@ class TestGetCurrentMember:
 
 class TestErrorHandling:
     @pytest.mark.asyncio
-    async def test_authentication_error(self, client: CraftnoteClient, httpx_mock: HTTPXMock):
+    async def test_authentication_error(
+        self, client_no_retry: CraftnoteClient, httpx_mock: HTTPXMock
+    ):
         httpx_mock.add_response(url=f"{TEST_BASE_URL}/projects?limit=100&offset=0", status_code=401)
 
-        async with client:
+        async with client_no_retry:
             with pytest.raises(CraftnoteAuthenticationError) as exc_info:
-                await client.list_projects()
+                await client_no_retry.list_projects()
 
         assert exc_info.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_not_found_error(self, client: CraftnoteClient, httpx_mock: HTTPXMock):
+    async def test_not_found_error(self, client_no_retry: CraftnoteClient, httpx_mock: HTTPXMock):
         httpx_mock.add_response(url=f"{TEST_BASE_URL}/projects/nonexistent", status_code=404)
 
-        async with client:
+        async with client_no_retry:
             with pytest.raises(CraftnoteNotFoundError) as exc_info:
-                await client.get_project("nonexistent")
+                await client_no_retry.get_project("nonexistent")
 
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_rate_limit_error(self, client: CraftnoteClient, httpx_mock: HTTPXMock):
+    async def test_rate_limit_error(self, client_no_retry: CraftnoteClient, httpx_mock: HTTPXMock):
         httpx_mock.add_response(url=f"{TEST_BASE_URL}/projects?limit=100&offset=0", status_code=429)
 
-        async with client:
+        async with client_no_retry:
             with pytest.raises(CraftnoteRateLimitError) as exc_info:
-                await client.list_projects()
+                await client_no_retry.list_projects()
 
         assert exc_info.value.status_code == 429
 
     @pytest.mark.asyncio
-    async def test_generic_api_error(self, client: CraftnoteClient, httpx_mock: HTTPXMock):
+    async def test_generic_api_error(self, client_no_retry: CraftnoteClient, httpx_mock: HTTPXMock):
         httpx_mock.add_response(
             url=f"{TEST_BASE_URL}/projects?limit=100&offset=0",
             status_code=500,
             text="Internal Server Error",
         )
 
-        async with client:
+        async with client_no_retry:
             with pytest.raises(CraftnoteAPIError) as exc_info:
-                await client.list_projects()
+                await client_no_retry.list_projects()
 
         assert exc_info.value.status_code == 500
 

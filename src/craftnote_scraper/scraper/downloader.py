@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -7,8 +8,11 @@ from typing import Final
 from playwright.async_api import Download, ElementHandle, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from craftnote_scraper.retry import RetryConfig, retry_async
 from craftnote_scraper.scraper.exceptions import ChatNavigationError, DownloadError
 from craftnote_scraper.scraper.login import CRAFTNOTE_APP_URL, ensure_logged_in
+
+logger = logging.getLogger(__name__)
 
 
 class DownloadableFileType(StrEnum):
@@ -39,7 +43,13 @@ DOWNLOAD_TIMEOUT_MS: Final[int] = 60_000
 SCROLL_DELAY_MS: Final[int] = 500
 RATE_LIMIT_DELAY_SECONDS: Final[float] = 1.0
 MAX_SCROLL_ATTEMPTS: Final[int] = 50
+DEFAULT_MAX_RETRIES: Final[int] = 3
 PROJECT_URL_TEMPLATE: Final[str] = f"{CRAFTNOTE_APP_URL}/projects/{{project_id}}"
+
+RETRYABLE_DOWNLOAD_EXCEPTIONS: tuple[type[Exception], ...] = (
+    PlaywrightTimeoutError,
+    DownloadError,
+)
 
 
 @dataclass(frozen=True)
@@ -243,23 +253,13 @@ async def _download_via_modal(page: Page, metadata: FileMetadata) -> Download:
     return await download_info.value
 
 
-async def download_file(
+async def _perform_download(
     page: Page,
     file_element: ElementHandle,
     metadata: FileMetadata,
     download_dir: Path,
 ) -> DownloadResult:
-    """
-    Download a file from a chat attachment element.
-
-    PDF files open a preview modal with a download icon.
-    XLSX/XLS files download directly when clicked.
-
-    Raises:
-        DownloadError: If download fails.
-    """
-    download_dir.mkdir(parents=True, exist_ok=True)
-
+    """Internal download logic without retry wrapper."""
     is_pdf = metadata.file_type == DownloadableFileType.PDF
 
     try:
@@ -293,6 +293,33 @@ async def download_file(
     except Exception as e:
         await _close_modal_if_open(page)
         raise DownloadError(f"Failed to download file: {metadata.filename}") from e
+
+
+async def download_file(
+    page: Page,
+    file_element: ElementHandle,
+    metadata: FileMetadata,
+    download_dir: Path,
+    retry_config: RetryConfig | None = None,
+) -> DownloadResult:
+    """
+    Download a file from a chat attachment element with retry support.
+
+    PDF files open a preview modal with a download icon.
+    XLSX/XLS files download directly when clicked.
+
+    Raises:
+        DownloadError: If download fails after all retries.
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    config = retry_config or RetryConfig(max_retries=DEFAULT_MAX_RETRIES)
+
+    return await retry_async(
+        lambda: _perform_download(page, file_element, metadata, download_dir),
+        RETRYABLE_DOWNLOAD_EXCEPTIONS,
+        config,
+        operation_name=f"download {metadata.filename}",
+    )
 
 
 async def download_all_project_files(
