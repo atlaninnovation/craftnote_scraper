@@ -46,6 +46,8 @@ class Project(BaseModel):
     projects: list[str] = []
     archived: bool = False
     creation_date: int | None = None
+    last_edited_date: int | None = None
+    last_opened_date: int | None = None
 
 
 class ProjectFile(BaseModel):
