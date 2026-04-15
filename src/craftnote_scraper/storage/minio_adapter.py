@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Final
 
 from minio import Minio
+from minio.error import S3Error
 from slugify import slugify
 
 from craftnote_scraper.storage.organizer import compute_checksum
@@ -61,10 +62,35 @@ class MinIOAdapter:
             secure=secure,
         )
         self._ensure_bucket_exists()
+        self._checksum_cache: set[str] | None = None
 
     def _ensure_bucket_exists(self) -> None:
         if not self._client.bucket_exists(BUCKET_NAME):
             self._client.make_bucket(BUCKET_NAME)
+
+    def _load_checksum_cache(self) -> set[str]:
+        if self._checksum_cache is not None:
+            return self._checksum_cache
+
+        logger.info("Loading checksum cache from MinIO (one-time operation)")
+        checksums: set[str] = set()
+
+        for prefix in (INBOX_PREFIX, ARCHIVE_PREFIX):
+            for obj in self._client.list_objects(BUCKET_NAME, prefix=prefix, recursive=True):
+                if obj.object_name.endswith(META_SUFFIX):
+                    continue
+                try:
+                    stat = self._client.stat_object(BUCKET_NAME, obj.object_name)
+                    if stat.metadata:
+                        checksum = stat.metadata.get(CHECKSUM_METADATA_KEY)
+                        if checksum:
+                            checksums.add(checksum)
+                except S3Error as err:
+                    logger.debug("Failed to stat object %s: %s", obj.object_name, err.code)
+
+        self._checksum_cache = checksums
+        logger.info("Loaded %d checksums into cache", len(checksums))
+        return checksums
 
     def upload_file(
         self,
@@ -102,7 +128,12 @@ class MinIOAdapter:
             craftnote_project_id=craftnote_project_id,
         )
 
+        self._checksum_cache_add(checksum)
         return UploadResult(object_key=object_key, checksum=checksum, uploaded=True)
+
+    def _checksum_cache_add(self, checksum: str) -> None:
+        if self._checksum_cache is not None:
+            self._checksum_cache.add(checksum)
 
     def _upload_metadata_sidecar(
         self,
@@ -152,17 +183,8 @@ class MinIOAdapter:
         return f"{INBOX_PREFIX}{farm_slug}/{turbine_slug}/{report_date}_{filename_slug}{ext}"
 
     def _exists_by_checksum(self, checksum: str) -> bool:
-        for prefix in (INBOX_PREFIX, ARCHIVE_PREFIX):
-            for obj in self._client.list_objects(BUCKET_NAME, prefix=prefix, recursive=True):
-                if obj.object_name.endswith(META_SUFFIX):
-                    continue
-                try:
-                    stat = self._client.stat_object(BUCKET_NAME, obj.object_name)
-                    if stat.metadata and stat.metadata.get(CHECKSUM_METADATA_KEY) == checksum:
-                        return True
-                except Exception:
-                    logger.debug("Failed to stat object %s, skipping", obj.object_name)
-        return False
+        checksums = self._load_checksum_cache()
+        return checksum in checksums
 
 
 DEFAULT_DATE: Final[str] = "unknown-date"
