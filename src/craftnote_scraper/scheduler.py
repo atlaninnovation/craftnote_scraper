@@ -74,7 +74,6 @@ async def run_incremental_sync(
     async with CraftnoteClient() as client:
         modified_projects = await client.get_modified_projects(cutoff_time, EXCLUDED_FOLDERS)
 
-        # Build mapping of parent_id -> parent name (wind farm)
         parent_ids = {p.parent_project for p in modified_projects if p.parent_project}
         parent_map: dict[str, str] = {}
         for parent_id in parent_ids:

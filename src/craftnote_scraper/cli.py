@@ -676,7 +676,6 @@ async def _get_modified_projects_with_parents(
     async with CraftnoteClient() as client:
         modified = await client.get_modified_projects(since, excluded_folders)
 
-        # Build mapping of project_id -> parent project name (wind farm)
         parent_ids = {p.parent_project for p in modified if p.parent_project}
         parent_map: dict[str, str] = {}
 
@@ -721,7 +720,6 @@ async def _sync_incremental_projects(
             )
 
             for project in projects:
-                # Resolve wind farm name from parent project
                 wind_farm = parent_map.get(project.parent_project, project.name)
                 turbine = project.name
 
