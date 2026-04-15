@@ -74,6 +74,16 @@ async def run_incremental_sync(
     async with CraftnoteClient() as client:
         modified_projects = await client.get_modified_projects(cutoff_time, EXCLUDED_FOLDERS)
 
+        # Build mapping of parent_id -> parent name (wind farm)
+        parent_ids = {p.parent_project for p in modified_projects if p.parent_project}
+        parent_map: dict[str, str] = {}
+        for parent_id in parent_ids:
+            try:
+                parent = await client.get_project(parent_id)
+                parent_map[parent_id] = parent.name
+            except Exception:
+                logger.debug("Could not fetch parent project %s", parent_id)
+
     if not modified_projects:
         logger.info("No projects modified since cutoff time")
         return {"projects_synced": 0, "files_downloaded": 0, "files_skipped": 0, "errors": 0}
@@ -90,12 +100,17 @@ async def run_incremental_sync(
         page = await context.new_page()
 
         for project in modified_projects:
-            logger.info("Syncing project: %s", project.name)
+            wind_farm = project.name
+            if project.parent_project and project.parent_project in parent_map:
+                wind_farm = parent_map[project.parent_project]
+            turbine = project.name
+
+            logger.info("Syncing project: %s / %s", wind_farm, turbine)
             project_files_downloaded = 0
             sync_status = SyncStatus.SUCCESS
 
             try:
-                project_dir = output_dir / project.name
+                project_dir = output_dir / wind_farm / turbine
                 results = await download_all_project_files(
                     page=page,
                     project_id=project.id,
@@ -111,8 +126,8 @@ async def run_incremental_sync(
 
                     final_path, checksum = save_file(
                         content=result.saved_path.read_bytes(),
-                        wind_farm=project.name,
-                        turbine=project.name,
+                        wind_farm=wind_farm,
+                        turbine=turbine,
                         filename=result.metadata.filename,
                         base_dir=output_dir,
                     )
@@ -124,8 +139,8 @@ async def run_incremental_sync(
                         downloaded_at=datetime.now(),
                         path=final_path,
                         checksum=checksum,
-                        wind_farm=project.name,
-                        turbine=project.name,
+                        wind_farm=wind_farm,
+                        turbine=turbine,
                     )
                     tracker.record_download(downloaded_file)
                     total_downloaded += 1
@@ -134,8 +149,8 @@ async def run_incremental_sync(
                     if minio:
                         upload_result = minio.upload_file(
                             file_path=final_path,
-                            wind_farm=project.name,
-                            turbine_name=project.name,
+                            wind_farm=wind_farm,
+                            turbine_name=turbine,
                             original_filename=result.metadata.filename,
                             craftnote_project_id=project.id,
                         )
@@ -151,7 +166,7 @@ async def run_incremental_sync(
             except Exception:
                 total_errors += 1
                 sync_status = SyncStatus.FAILED
-                logger.exception("Error syncing project %s", project.name)
+                logger.exception("Error syncing project %s", turbine)
 
             last_edited_at = None
             if project.last_edited_date:
@@ -159,8 +174,8 @@ async def run_incremental_sync(
 
             tracker.record_project_sync(
                 project_id=project.id,
-                project_name=project.name,
-                wind_farm=project.name,
+                project_name=turbine,
+                wind_farm=wind_farm,
                 last_edited_at=last_edited_at,
                 files_downloaded=project_files_downloaded,
                 sync_status=sync_status,

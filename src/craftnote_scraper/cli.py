@@ -628,7 +628,9 @@ def sync_incremental(
     ) as progress:
         progress.add_task("Fetching modified projects from API...", total=None)
         try:
-            modified_projects = asyncio.run(_get_modified_projects(cutoff_time, EXCLUDED_FOLDERS))
+            modified_projects, parent_map = asyncio.run(
+                _get_modified_projects_with_parents(cutoff_time, EXCLUDED_FOLDERS)
+            )
         except CraftnoteAPIError as e:
             error_console.print(f"[red]API Error:[/red] {e}")
             raise typer.Exit(EXIT_CODE_ERROR) from e
@@ -642,17 +644,18 @@ def sync_incremental(
     if dry_run:
         console.print("\n[yellow]Dry run mode - no files will be downloaded[/yellow]\n")
         table = Table(title="Projects to Sync")
-        table.add_column("Project Name", style="cyan")
+        table.add_column("Wind Farm", style="cyan")
+        table.add_column("Turbine", style="cyan")
         table.add_column("Last Edited", style="green")
-        table.add_column("Project ID", style="dim")
 
         for project in modified_projects:
+            wind_farm = parent_map.get(project.parent_project, project.name)
             last_edited = "N/A"
             if project.last_edited_date:
                 last_edited = datetime.fromtimestamp(project.last_edited_date).strftime(
                     "%Y-%m-%d %H:%M"
                 )
-            table.add_row(project.name, last_edited, project.id[:12] + "...")
+            table.add_row(wind_farm, project.name, last_edited)
 
         console.print(table)
         if upload_to_minio:
@@ -660,17 +663,36 @@ def sync_incremental(
         raise typer.Exit(EXIT_CODE_SUCCESS)
 
     asyncio.run(
-        _sync_incremental_projects(modified_projects, output_dir, tracker, headless, verbose, minio)
+        _sync_incremental_projects(
+            modified_projects, parent_map, output_dir, tracker, headless, verbose, minio
+        )
     )
 
 
-async def _get_modified_projects(since: datetime, excluded_folders: frozenset[str]) -> list:
+async def _get_modified_projects_with_parents(
+    since: datetime, excluded_folders: frozenset[str]
+) -> tuple[list, dict[str, str]]:
+    """Get modified projects and a mapping of project_id -> wind_farm_name."""
     async with CraftnoteClient() as client:
-        return await client.get_modified_projects(since, excluded_folders)
+        modified = await client.get_modified_projects(since, excluded_folders)
+
+        # Build mapping of project_id -> parent project name (wind farm)
+        parent_ids = {p.parent_project for p in modified if p.parent_project}
+        parent_map: dict[str, str] = {}
+
+        for parent_id in parent_ids:
+            try:
+                parent = await client.get_project(parent_id)
+                parent_map[parent_id] = parent.name
+            except CraftnoteAPIError:
+                pass
+
+        return modified, parent_map
 
 
 async def _sync_incremental_projects(
     projects: list,
+    parent_map: dict[str, str],
     output_dir: Path,
     tracker: DownloadTracker,
     headless: bool,
@@ -699,12 +721,16 @@ async def _sync_incremental_projects(
             )
 
             for project in projects:
-                progress.update(overall_task, description=f"[cyan]{project.name}")
+                # Resolve wind farm name from parent project
+                wind_farm = parent_map.get(project.parent_project, project.name)
+                turbine = project.name
+
+                progress.update(overall_task, description=f"[cyan]{wind_farm} / {turbine}")
                 project_files_downloaded = 0
                 sync_status = SyncStatus.SUCCESS
 
                 try:
-                    project_dir = output_dir / project.name
+                    project_dir = output_dir / wind_farm / turbine
                     results = await download_all_project_files(
                         page=page,
                         project_id=project.id,
@@ -720,8 +746,8 @@ async def _sync_incremental_projects(
 
                         final_path, checksum = save_file(
                             content=result.saved_path.read_bytes(),
-                            wind_farm=project.name,
-                            turbine=project.name,
+                            wind_farm=wind_farm,
+                            turbine=turbine,
                             filename=result.metadata.filename,
                             base_dir=output_dir,
                         )
@@ -733,8 +759,8 @@ async def _sync_incremental_projects(
                             downloaded_at=datetime.now(),
                             path=final_path,
                             checksum=checksum,
-                            wind_farm=project.name,
-                            turbine=project.name,
+                            wind_farm=wind_farm,
+                            turbine=turbine,
                         )
                         tracker.record_download(downloaded_file)
                         total_downloaded += 1
@@ -743,8 +769,8 @@ async def _sync_incremental_projects(
                         if minio:
                             upload_result = minio.upload_file(
                                 file_path=final_path,
-                                wind_farm=project.name,
-                                turbine_name=project.name,
+                                wind_farm=wind_farm,
+                                turbine_name=turbine,
                                 original_filename=result.metadata.filename,
                                 craftnote_project_id=project.id,
                             )
@@ -762,7 +788,7 @@ async def _sync_incremental_projects(
                     total_errors += 1
                     sync_status = SyncStatus.FAILED
                     if verbose:
-                        error_console.print(f"[red]Error syncing {project.name}: {e}[/red]")
+                        error_console.print(f"[red]Error syncing {turbine}: {e}[/red]")
 
                 last_edited_at = None
                 if project.last_edited_date:
@@ -770,8 +796,8 @@ async def _sync_incremental_projects(
 
                 tracker.record_project_sync(
                     project_id=project.id,
-                    project_name=project.name,
-                    wind_farm=project.name,
+                    project_name=turbine,
+                    wind_farm=wind_farm,
                     last_edited_at=last_edited_at,
                     files_downloaded=project_files_downloaded,
                     sync_status=sync_status,
