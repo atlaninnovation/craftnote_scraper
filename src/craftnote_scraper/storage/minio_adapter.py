@@ -170,7 +170,9 @@ DEFAULT_DATE: Final[str] = "unknown-date"
 YYYYMMDD_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"[_\s]((?:19|20)\d{2})(\d{2})(\d{2})(?:[_\s]\d{6,}|[_\s][a-zA-Z]|\.[a-zA-Z]+$)"
 )
-ISO_DATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(\d{4})[.\-/](\d{1,2})[.\-/](\d{1,2})")
+YYYY_MM_DD_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"((?:19|20)\d{2})[.\-_/](\d{1,2})[.\-_/](\d{1,2})"
+)
 DDMMYY_COMPACT_PATTERN: Final[re.Pattern[str]] = re.compile(r"^(\d{2})(\d{2})(\d{2})\s")
 DATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})")
 DATE_SPACE_PATTERN: Final[re.Pattern[str]] = re.compile(r"(\d{1,2})\s+(\d{1,2})\.(\d{4})")
@@ -194,6 +196,7 @@ def extract_date_from_filename(filename: str) -> str:
     Supports formats:
     - "Servicebericht Boddin 6.5.2025.pdf" -> "2025-05-06"
     - "Report 2025-05-06.pdf" -> "2025-05-06"
+    - "2026_04_13_GE15560452.pdf" -> "2026-04-13"
     - "WEA4_12-05-2025.xlsx" -> "2025-05-12"
     - "230725 BA2.pdf" -> "2025-07-23" (DDMMYY compact at start)
     - "GE_15560445_20260324.pdf" -> "2026-03-24" (YYYYMMDD with underscores)
@@ -204,7 +207,7 @@ def extract_date_from_filename(filename: str) -> str:
         year, month, day = match.groups()
         return _format_date(year, month, day)
 
-    if match := ISO_DATE_PATTERN.search(filename):
+    if match := YYYY_MM_DD_PATTERN.search(filename):
         year, month, day = match.groups()
         return _format_date(year, month, day)
 
