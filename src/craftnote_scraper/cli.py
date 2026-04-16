@@ -960,7 +960,12 @@ def daemon(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose output")] = False,
 ) -> None:
     """Run as a background daemon with scheduled incremental sync."""
-    setup_logging(verbose)
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        force=True,
+    )
 
     from craftnote_scraper.scheduler import (
         SYNC_SCHEDULE_ENV_VAR,
