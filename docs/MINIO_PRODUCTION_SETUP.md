@@ -289,6 +289,81 @@ launchctl load ~/Library/LaunchAgents/de.windreserve.craftnote-sync.plist
 
 The scraper will continue to work without MinIO upload. Files will still be downloaded locally.
 
+## Asynchronous Upload Workflow (Recommended)
+
+Since MinIO uploads add significant overhead to the sync process (checksum validation, cache loading), it's recommended to decouple downloads from uploads:
+
+### Architecture
+
+- **Daily Sync** (fast): Download new files only, skip MinIO uploads
+- **Separate Upload Job** (scheduled daily): Upload all pending files to MinIO
+
+### Setup
+
+#### 1. Modify Daemon Configuration
+
+Update the launchd plist to remove `--upload-to-minio`:
+
+```xml
+<key>ProgramArguments</key>
+<array>
+    <string>/path/to/craftnote-scraper</string>
+    <string>daemon</string>
+    <!-- Remove: <string>--upload-to-minio</string> -->
+</array>
+```
+
+This makes sync runs complete in ~5 minutes instead of 30+ minutes.
+
+#### 2. Create Daily Upload Cron Job
+
+Add this to your crontab (`crontab -e`):
+
+```bash
+# Run upload-pending daily at 2 AM (off-peak hours)
+0 2 * * * cd /Users/anwender/DEV/craftnote_scraper && \
+  export MINIO_ENDPOINT=10.25.10.104:9000 && \
+  export MINIO_ACCESS_KEY=windee && \
+  export MINIO_SECRET_KEY='windee-minio-secret-key-32chars!' && \
+  export MINIO_USE_SSL=false && \
+  export MINIO_BUCKET=service-reports && \
+  uv run craftnote-scraper upload-pending >> ~/craftnote-upload.log 2>&1
+```
+
+#### 3. Verify Uploads
+
+Check the upload log:
+
+```bash
+tail -f ~/craftnote-upload.log
+```
+
+### Advantages
+
+- **Fast Syncs**: Downloads complete in ~5 minutes (no MinIO overhead)
+- **Resilient**: Failed uploads don't block downloads
+- **Flexible Scheduling**: Upload during off-peak hours
+- **Monitoring**: Separate logs for upload activity
+- **Easy Troubleshooting**: Can manually run `upload-pending` for debugging
+
+### Manual Upload
+
+To manually upload pending files:
+
+```bash
+export MINIO_ENDPOINT=10.25.10.104:9000
+export MINIO_ACCESS_KEY=windee
+export MINIO_SECRET_KEY='windee-minio-secret-key-32chars!'
+export MINIO_USE_SSL=false
+export MINIO_BUCKET=service-reports
+
+# Upload all pending files
+uv run craftnote-scraper upload-pending --verbose
+
+# Check pending count
+sqlite3 downloads.db "SELECT COUNT(*) as pending FROM downloaded_files WHERE minio_uploaded_at IS NULL;"
+```
+
 ## Next Steps
 
 1. ✓ Test connectivity to MinIO
