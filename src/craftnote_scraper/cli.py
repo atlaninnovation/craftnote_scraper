@@ -545,6 +545,92 @@ async def _sync_farms(
         raise typer.Exit(EXIT_CODE_ERROR)
 
 
+@app.command("upload-pending")
+def upload_pending(
+    db_path: Annotated[
+        Path, typer.Option("--db", help="Path to download tracking database")
+    ] = Path(DEFAULT_DB_PATH),
+    verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Enable verbose output")] = False,
+) -> None:
+    """Upload all pending files to MinIO that haven't been uploaded yet."""
+    setup_logging(verbose)
+
+    try:
+        minio = create_minio_adapter()
+    except ValueError as e:
+        error_console.print(f"[red]MinIO configuration error:[/red] {e}")
+        raise typer.Exit(EXIT_CODE_ERROR) from e
+
+    tracker = DownloadTracker(db_path)
+    pending_files = tracker.get_pending_uploads()
+
+    if not pending_files:
+        console.print("[dim]No pending files to upload[/dim]")
+        raise typer.Exit(EXIT_CODE_SUCCESS)
+
+    console.print(f"Uploading {len(pending_files)} pending files to MinIO...\n")
+
+    total_uploaded = 0
+    total_skipped = 0
+    total_errors = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Uploading...", total=len(pending_files))
+
+        for file in pending_files:
+            file_path = Path(file.path)
+            progress.update(task, description=f"[cyan]{file.filename}")
+
+            if not file_path.exists():
+                error_console.print(f"[red]✗[/red] {file.filename} - file not found")
+                total_errors += 1
+                progress.advance(task)
+                continue
+
+            try:
+                upload_result = minio.upload_file(
+                    file_path=file_path,
+                    wind_farm=file.wind_farm,
+                    turbine_name=file.turbine,
+                    original_filename=file.filename,
+                    craftnote_project_id="unknown",
+                )
+
+                if upload_result.uploaded:
+                    tracker.update_minio_upload(
+                        file_id=file.file_id,
+                        object_key=upload_result.object_key,
+                        uploaded_at=datetime.now(),
+                    )
+                    total_uploaded += 1
+                    if verbose:
+                        console.print(f"[green]✓[/green] {file.filename}")
+                else:
+                    total_skipped += 1
+                    if verbose:
+                        console.print(f"[dim]⊘[/dim] {file.filename} (already exists)")
+
+            except Exception as e:
+                total_errors += 1
+                error_console.print(f"[red]✗[/red] {file.filename}: {str(e)[:60]}")
+
+            progress.advance(task)
+
+    console.print("\n[green]Upload complete![/green]")
+    console.print(f"  Uploaded: {total_uploaded}")
+    if total_skipped > 0:
+        console.print(f"  Skipped (duplicates): {total_skipped}")
+    if total_errors > 0:
+        error_console.print(f"  [red]Errors: {total_errors}[/red]")
+        raise typer.Exit(EXIT_CODE_ERROR)
+
+
 def parse_duration(duration_str: str) -> timedelta:
     duration_str = duration_str.strip().lower()
 

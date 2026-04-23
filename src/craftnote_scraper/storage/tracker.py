@@ -317,3 +317,11 @@ class DownloadTracker:
         with self._connection() as conn:
             cursor = conn.execute(SELECT_ALL_PROJECT_SYNCS_SQL)
             return [_row_to_project_sync_record(row) for row in cursor.fetchall()]
+
+    def get_pending_uploads(self) -> list[DownloadedFile]:
+        """Get all files that have been downloaded but not yet uploaded to MinIO."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM downloaded_files WHERE minio_uploaded_at IS NULL ORDER BY downloaded_at"
+            )
+            return [_row_to_downloaded_file(row) for row in cursor.fetchall()]
