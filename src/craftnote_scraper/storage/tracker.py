@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from craftnote_scraper.storage.models import DownloadedFile, FileType
+
+if TYPE_CHECKING:
+    from craftnote_scraper.storage.minio_adapter import MinIOAdapter
 
 DEFAULT_DB_PATH: Final[str] = "downloads.db"
 
@@ -317,3 +320,65 @@ class DownloadTracker:
         with self._connection() as conn:
             cursor = conn.execute(SELECT_ALL_PROJECT_SYNCS_SQL)
             return [_row_to_project_sync_record(row) for row in cursor.fetchall()]
+
+    def get_pending_uploads(self) -> list[DownloadedFile]:
+        """Get all files that have been downloaded but not yet uploaded to MinIO."""
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM downloaded_files WHERE minio_uploaded_at IS NULL "
+                "ORDER BY downloaded_at"
+            )
+            return [_row_to_downloaded_file(row) for row in cursor.fetchall()]
+
+
+async def upload_pending_files(
+    tracker: DownloadTracker,
+    minio: "MinIOAdapter",
+) -> dict[str, int]:
+    """
+    Upload all pending files to MinIO.
+
+    Returns a dict with keys: uploaded, skipped, errors
+    """
+    pending_files = tracker.get_pending_uploads()
+
+    if not pending_files:
+        return {"uploaded": 0, "skipped": 0, "errors": 0}
+
+    total_uploaded = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for file in pending_files:
+        file_path = Path(file.path)
+
+        if not file_path.exists():
+            total_errors += 1
+            continue
+
+        try:
+            upload_result = minio.upload_file(
+                file_path=file_path,
+                wind_farm=file.wind_farm,
+                turbine_name=file.turbine,
+                original_filename=file.filename,
+                craftnote_project_id="unknown",
+            )
+
+            if upload_result.uploaded:
+                tracker.update_minio_upload(
+                    file_id=file.file_id,
+                    object_key=upload_result.object_key,
+                    uploaded_at=datetime.now(),
+                )
+                total_uploaded += 1
+            else:
+                total_skipped += 1
+        except Exception:
+            total_errors += 1
+
+    return {
+        "uploaded": total_uploaded,
+        "skipped": total_skipped,
+        "errors": total_errors,
+    }

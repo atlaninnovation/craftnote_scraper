@@ -253,9 +253,26 @@ class CraftnoteClient:
     ) -> list[Project]:
         cutoff_timestamp = since.timestamp()
         modified_projects: list[Project] = []
+        parent_name_cache: dict[str, str] = {}
 
         async for project in self.iter_all_projects():
             if excluded_folders and project.name in excluded_folders:
+                continue
+
+            parent_is_excluded = False
+            if excluded_folders and project.parent_project:
+                if project.parent_project not in parent_name_cache:
+                    try:
+                        parent = await self.get_project(project.parent_project)
+                        parent_name_cache[project.parent_project] = parent.name
+                    except Exception:
+                        parent_name_cache[project.parent_project] = ""
+
+                parent_name = parent_name_cache[project.parent_project]
+                if parent_name in excluded_folders:
+                    parent_is_excluded = True
+
+            if parent_is_excluded:
                 continue
 
             if project.last_edited_date and project.last_edited_date > cutoff_timestamp:

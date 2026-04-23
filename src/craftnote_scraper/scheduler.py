@@ -19,13 +19,15 @@ from craftnote_scraper.scraper.downloader import download_all_project_files
 from craftnote_scraper.storage.minio_adapter import MinIOAdapter
 from craftnote_scraper.storage.models import DownloadedFile, FileType
 from craftnote_scraper.storage.organizer import save_file
-from craftnote_scraper.storage.tracker import DownloadTracker, SyncStatus
+from craftnote_scraper.storage.tracker import DownloadTracker, SyncStatus, upload_pending_files
 
 logger = logging.getLogger(__name__)
 
 SYNC_SCHEDULE_ENV_VAR: Final[str] = "SYNC_SCHEDULE"
 SYNC_LOOKBACK_HOURS_ENV_VAR: Final[str] = "SYNC_LOOKBACK_HOURS"
+UPLOAD_SCHEDULE_ENV_VAR: Final[str] = "UPLOAD_SCHEDULE"
 DEFAULT_TIMEZONE: Final[str] = "Europe/Berlin"
+DEFAULT_UPLOAD_SCHEDULE: Final[str] = "0 2 * * *"  # 2 AM daily
 
 MINIO_ENDPOINT_VAR: Final[str] = "MINIO_ENDPOINT"
 MINIO_ACCESS_KEY_VAR: Final[str] = "MINIO_ACCESS_KEY"
@@ -35,6 +37,10 @@ MINIO_USE_SSL_VAR: Final[str] = "MINIO_USE_SSL"
 
 def get_sync_schedule() -> str:
     return os.environ.get(SYNC_SCHEDULE_ENV_VAR, DEFAULT_SYNC_SCHEDULE)
+
+
+def get_upload_schedule() -> str:
+    return os.environ.get(UPLOAD_SCHEDULE_ENV_VAR, DEFAULT_UPLOAD_SCHEDULE)
 
 
 def get_lookback_hours() -> int:
@@ -203,6 +209,7 @@ def create_scheduler(
 
     schedule = get_sync_schedule()
     lookback_hours = get_lookback_hours()
+    upload_schedule = get_upload_schedule()
 
     clock = AioClock()
 
@@ -216,6 +223,15 @@ def create_scheduler(
             headless=headless,
             minio=minio,
         )
+
+    @clock.task(trigger=Cron(cron=upload_schedule, tz=DEFAULT_TIMEZONE))
+    async def daily_upload() -> None:
+        if not minio:
+            logger.debug("MinIO not configured, skipping upload task")
+            return
+        logger.info("Scheduled upload triggered")
+        stats = await upload_pending_files(tracker, minio)
+        logger.info("Upload complete: %s", stats)
 
     return clock
 
